@@ -1,0 +1,91 @@
+---
+title: "Online Retail Data Munging"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: flatly
+---
+
+```{r setup, message=FALSE}
+library(dplyr)
+library(readxl)
+library(lubridate)
+library(stringr)
+```
+
+## Load and inspect raw extract
+
+```{r load-inspect}
+retail_raw <- read_excel("Online Retail.xlsx") %>%
+  rename(InvoiceDateTime = InvoiceDate)
+
+retail_quality <- retail_raw %>%
+  summarise(
+    rows = n(),
+    missing_description = sum(is.na(Description)),
+    missing_customer_id = sum(is.na(CustomerID)),
+    non_positive_quantity = sum(Quantity <= 0, na.rm = TRUE),
+    non_positive_price = sum(UnitPrice <= 0, na.rm = TRUE)
+  )
+
+retail_quality
+```
+
+The extract includes `r format(retail_quality$rows, big.mark = ",")` rows with notable gaps in `CustomerID` and `Description`, plus return/zero-value lines worth removing ahead of analysis.
+
+## Clean and enrich
+
+```{r clean}
+retail_clean <-
+  retail_raw %>%
+  mutate(
+    InvoiceNo = as.character(InvoiceNo),
+    StockCode = str_trim(StockCode),
+    Description = str_squish(Description),
+    CustomerID = as.character(CustomerID),
+    InvoiceDateTime = as.POSIXct(InvoiceDateTime, tz = "UTC")
+  ) %>%
+  filter(
+    !is.na(CustomerID),
+    !is.na(Description),
+    Quantity > 0,
+    UnitPrice > 0
+  ) %>%
+  mutate(
+    InvoiceDate = as.Date(InvoiceDateTime),
+    InvoiceTime = format(InvoiceDateTime, "%H:%M:%S"),
+    InvoiceMonth = floor_date(InvoiceDateTime, unit = "month"),
+    TotalPrice = Quantity * UnitPrice
+  ) %>%
+  distinct()
+
+retail_clean_summary <- retail_clean %>%
+  summarise(
+    rows = n(),
+    unique_invoices = n_distinct(InvoiceNo),
+    unique_customers = n_distinct(CustomerID),
+    unique_countries = n_distinct(Country),
+    first_invoice = min(InvoiceDate),
+    last_invoice = max(InvoiceDate)
+  )
+
+retail_clean_summary
+```
+
+The cleaned dataset retains `r format(retail_clean_summary$rows, big.mark = ",")` transactions across `r retail_clean_summary$unique_customers` customers in `r retail_clean_summary$unique_countries` countries, spanning invoices from `r retail_clean_summary$first_invoice` to `r retail_clean_summary$last_invoice`. The additional `InvoiceDate`, `InvoiceTime`, `InvoiceMonth`, and `TotalPrice` fields support time-based summaries and revenue analysis.
+
+## Snapshot
+
+```{r snapshot}
+retail_clean %>%
+  arrange(InvoiceDateTime) %>%
+  select(InvoiceNo, InvoiceDateTime, InvoiceMonth, CustomerID, Country, StockCode, Quantity, UnitPrice, TotalPrice) %>%
+  head()
+```
+
+Save `retail_clean` for downstream EDA or write it to disk:
+
+```{r save, eval=FALSE}
+write.csv(retail_clean, "online_retail_clean.csv", row.names = FALSE)
+```
