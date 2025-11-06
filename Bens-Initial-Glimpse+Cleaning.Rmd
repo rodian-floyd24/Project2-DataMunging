@@ -1,0 +1,88 @@
+---
+title: "OnlineShoppingProject2"
+author: "Ben Holloway"
+date: "2025-11-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+
+library(readr)
+library(dplyr)
+
+
+getwd()
+
+Retail <- read.csv("C:/Users/brhol/Downloads/OnlineRetail_UCIrivine")
+
+unzip("C:/Users/brhol/Downloads/OnlineRetail_UCIrivine.zip", list = TRUE)
+
+unzip("C:/Users/brhol/Downloads/OnlineRetail_UCIrivine.zip", exdir = "C:/Users/brhol/Downloads")
+
+list.files("C:/Users/brhol/Downloads", pattern = "OnlineRetail", full.names = TRUE)
+
+install.packages("readxl")
+library(readxl)
+
+Retail <- read_excel("C:/Users/brhol/Downloads/Online Retail.xlsx")
+  
+
+#looks like we were able to get the file
+
+#lets get a quick look at the data set
+
+# See the first few rows
+head(Retail)
+
+# See column names
+colnames(Retail)
+
+summary(Retail)
+
+glimpse(Retail)
+
+
+#check for missing values
+colSums(is.na(Retail))
+
+#percentage of missing values per column
+sapply(Retail, function(x) round(mean(is.na(x)) * 100, 2))
+
+Retail_clean <- Retail %>%
+  # Remove rows with missing CustomerID (common step)
+  filter(!is.na(CustomerID)) %>%
+  # Remove rows where Quantity or UnitPrice are zero or negative
+  filter(Quantity > 0, UnitPrice > 0) %>%
+  # Trim extra spaces in text fields
+  mutate(
+    Description = trimws(Description),
+    Country = trimws(Country)
+  )
+
+#lets look at the clean result
+
+nrow(Retail_clean)          # how many rows remain
+sum(is.na(Retail_clean))    # total NAs left
+
+
+#checking for duplicates
+Retail_clean <- Retail_clean %>%
+  distinct()
+
+```
+
+```{r}
+
+
+
+```
