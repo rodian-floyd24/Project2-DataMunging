@@ -1,0 +1,475 @@
+---
+title: "Online Retail: Findings & Methods"
+author: "Group Project"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(broom)
+library(knitr)
+library(tidyr)
+library(stringr)
+library(purrr)
+
+options(dplyr.summarise.inform = FALSE)
+
+path <- "online_retail_clean.csv"
+# Read raw extract (cleaned file) and apply cleaning transparently for the report
+dt_raw <- fread(path)
+
+dt_typed <- dt_raw %>%
+  mutate(
+    InvoiceDateTime = as.POSIXct(InvoiceDateTime),
+    Quantity = as.numeric(Quantity),
+    UnitPrice = as.numeric(UnitPrice)
+  )
+
+dt_clean <- dt_typed %>%
+  filter(!is.na(Description) & Description != "",
+         !is.na(CustomerID),
+         Quantity > 0,
+         UnitPrice > 0) %>%
+  mutate(
+    InvoiceDate = as.Date(InvoiceDateTime),
+    InvoiceMonth = floor_date(InvoiceDateTime, unit = "month"),
+    TotalPrice = Quantity * UnitPrice
+  )
+
+sales <- dt_clean
+snapshot_date <- max(sales$InvoiceDate, na.rm = TRUE) + days(1)
+
+missing_summary <- data.frame(
+  column = names(dt_typed),
+  missing_pct = sapply(dt_typed, function(x) mean(is.na(x)) * 100)
+) %>% arrange(desc(missing_pct))
+
+pre_post_quality <- tibble(
+  metric = c("Rows", "Missing CustomerID", "Missing Description", "Non-positive qty/price"),
+  raw = c(nrow(dt_typed),
+          sum(is.na(dt_typed$CustomerID)),
+          sum(is.na(dt_typed$Description) | dt_typed$Description == ""),
+          sum(dt_typed$Quantity <= 0 | dt_typed$UnitPrice <= 0)),
+  cleaned = c(nrow(dt_clean),
+              sum(is.na(dt_clean$CustomerID)),
+              sum(is.na(dt_clean$Description) | dt_clean$Description == ""),
+              sum(dt_clean$Quantity <= 0 | dt_clean$UnitPrice <= 0))
+)
+
+missing_bar <- missing_summary %>%
+  mutate(missing_pct = missing_pct / 100)
+
+rev_check <- tibble(
+  version = c("Raw", "Cleaned"),
+  revenue = c(sum(dt_typed$Quantity * dt_typed$UnitPrice, na.rm = TRUE),
+              sum(dt_clean$TotalPrice, na.rm = TRUE))
+)
+
+data_dictionary <- tribble(
+  ~Column, ~Definition,
+  "InvoiceNo", "Unique invoice identifier (string)",
+  "StockCode", "Product code",
+  "Description", "Product description (text)",
+  "Quantity", "Units per line (numeric)",
+  "InvoiceDateTime", "Transaction timestamp (POSIXct, UTC)",
+  "UnitPrice", "Unit price in source currency",
+  "CustomerID", "Numeric customer identifier",
+  "Country", "Billing/ship country",
+  "InvoiceDate", "Date (derived from InvoiceDateTime)",
+  "InvoiceMonth", "Month floor (derived)",
+  "TotalPrice", "Line revenue = Quantity * UnitPrice"
+)
+
+monthly_df <- sales %>%
+  group_by(InvoiceMonth) %>%
+  summarise(
+    revenue = sum(TotalPrice, na.rm = TRUE),
+    orders = n_distinct(InvoiceNo),
+    .groups = "drop"
+  )
+
+customers <- sales %>%
+  group_by(CustomerID) %>%
+  summarise(
+    recency = as.numeric(snapshot_date - max(InvoiceDate, na.rm = TRUE)),
+    frequency = n_distinct(InvoiceNo),
+    monetary = sum(TotalPrice, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+rfm_lm <- lm(monetary ~ recency + frequency, data = customers)
+rfm_lm_tidy <- tidy(rfm_lm)
+rfm_ci <- confint(rfm_lm) %>% as.data.frame() %>% tibble::rownames_to_column("term")
+
+vif_rec <- 1 / (1 - summary(lm(recency ~ frequency, data = customers))$r.squared)
+vif_freq <- 1 / (1 - summary(lm(frequency ~ recency, data = customers))$r.squared)
+
+rfm_lm_int <- lm(monetary ~ recency + frequency + I(frequency^2) + recency:frequency, data = customers)
+rfm_int_tidy <- tidy(rfm_lm_int)
+
+set.seed(123)
+rfm_scaled <- scale(select(customers, recency, frequency, monetary))
+rfm_k <- kmeans(rfm_scaled, centers = 4, nstart = 10)
+rfm_clusters <- customers %>%
+  mutate(cluster = rfm_k$cluster) %>%
+  group_by(cluster) %>%
+  summarise(across(c(recency, frequency, monetary), list(mean = mean, median = median), .names = "{.col}_{.fn}"),
+            n = n(), .groups = "drop")
+
+daily_revenue <- sales %>%
+  group_by(InvoiceDate) %>%
+  summarise(revenue = sum(TotalPrice, na.rm = TRUE), .groups = "drop")
+ts_rev <- ts(daily_revenue$revenue, frequency = 7)
+stl_rev <- stl(ts_rev, s.window = "periodic")
+stl_df <- tibble(
+  date = daily_revenue$InvoiceDate,
+  trend = stl_rev$time.series[, "trend"],
+  seasonal = stl_rev$time.series[, "seasonal"],
+  remainder = stl_rev$time.series[, "remainder"]
+) %>%
+  pivot_longer(-date, names_to = "component", values_to = "value")
+```
+
+# Overview
+
+- Data: Online Retail transactions with timestamps, products, quantities, prices, customer IDs, and country.
+- Objective: Summarize cleaning, quality, key patterns, and one relationship analyzed visually + via regression.
+- Interactive companion: Shiny app (`app.R`) provides filters and richer exploration; this report is the static submission.
+
+# Data quality & preprocessing
+
+### Cleaning steps (code + rationale)
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+dt_clean <- dt_typed %>%
+  # drops blank descriptions to avoid noisy product ranks
+  filter(!is.na(Description) & Description != "") %>%
+  # drops anonymous rows for RFM/customer views
+  filter(!is.na(CustomerID)) %>%
+  # returns/credits removed to analyze revenue as nonnegative
+  filter(Quantity > 0, UnitPrice > 0) %>%
+  mutate(
+    InvoiceDate = as.Date(InvoiceDateTime),
+    InvoiceMonth = floor_date(InvoiceDateTime, unit = "month"),
+    TotalPrice = Quantity * UnitPrice
+  )
+```
+
+### Missingness snapshot
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(missing_bar, aes(x = reorder(column, missing_pct), y = missing_pct)) +
+  geom_col(fill = "#4e79a7") +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Column", y = "% missing", title = "Missingness (raw extract)") +
+  theme_minimal()
+```
+
+### Pre / post cleaning check
+
+```{r, echo=FALSE}
+kable(pre_post_quality, col.names = c("Metric", "Raw", "Cleaned"), format.args = list(big.mark = ","))
+```
+
+```{r, echo=FALSE}
+kable(rev_check, col.names = c("Version", "Total revenue"), format.args = list(big.mark = ",", scientific = FALSE))
+```
+
+### Data dictionary
+
+```{r, echo=FALSE}
+kable(data_dictionary, col.names = c("Column", "Definition"))
+```
+
+```{r, echo=FALSE}
+kable(missing_summary, col.names = c("Column", "Missing (%)"), digits = 2)
+```
+
+- Missingness: Invoice fields and numeric measures show 0% missing; gaps in CustomerID/Description exist in raw extract and are dropped for analysis.  
+- Recoding: Derived `TotalPrice = Quantity * UnitPrice`, `InvoiceMonth` (month floor), `InvoiceDate`, and time splits using `lubridate`. Types enforced on load (`InvoiceDateTime` to POSIXct; numeric casts for `Quantity`, `UnitPrice`).  
+- Assumptions: Currency as provided in source; negative quantities indicate returns/credits and are removed to model revenue as nonnegative; timestamps assumed UTC as in source data.
+
+# Key findings (static visuals)
+
+## Monthly revenue and orders
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+p_month <- monthly_df %>%
+  tidyr::pivot_longer(c(revenue, orders), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(InvoiceMonth, value, color = metric)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("revenue" = "#1f77b4", "orders" = "#d62728"), labels = c("Orders", "Revenue")) +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Month", y = "Value", color = "Metric", title = "Monthly trend") +
+  theme_minimal()
+p_month
+```
+
+*Interpretation:* Orders and revenue rise together, especially in Q4, indicating growth driven by more orders (breadth) rather than just higher tickets.
+
+## Product revenue Pareto (long tail)
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+pareto_df <- sales %>%
+  group_by(Description) %>%
+  summarise(revenue = sum(TotalPrice, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(revenue)) %>%
+  mutate(cum_share = cumsum(revenue) / sum(revenue),
+         rank = row_number()) %>%
+  slice_head(n = 30)
+
+ggplot(pareto_df, aes(x = rank, y = revenue)) +
+  geom_col(fill = "#4e79a7") +
+  geom_line(aes(y = cum_share * max(revenue)), color = "#f28e2b", size = 1) +
+  scale_y_continuous(labels = dollar, sec.axis = sec_axis(~./max(pareto_df$revenue), labels = percent, name = "Cumulative share")) +
+  labs(x = "Product rank (by revenue)", y = "Revenue", title = "Product revenue Pareto (top 30)") +
+  theme_minimal()
+```
+
+*Interpretation:* A handful of SKUs drive a large share of revenue; the orange line shows cumulative share (long tail beyond the top ranks).
+
+## Product × country mix (static snapshot)
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+top_countries <- sales %>%
+  group_by(Country) %>%
+  summarise(revenue = sum(TotalPrice, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(order_by = revenue, n = 6) %>%
+  pull(Country)
+
+top_products <- sales %>%
+  group_by(Description) %>%
+  summarise(revenue = sum(TotalPrice, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(order_by = revenue, n = 12) %>%
+  pull(Description)
+
+heat_df <- sales %>%
+  filter(Country %in% top_countries, Description %in% top_products) %>%
+  group_by(Country, Description) %>%
+  summarise(revenue = sum(TotalPrice, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Country) %>%
+  mutate(country_rev = sum(revenue), share = revenue / country_rev) %>%
+  ungroup()
+
+ggplot(heat_df, aes(x = Description, y = Country, fill = share)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "inferno", labels = percent) +
+  labs(x = "Product", y = "Country", fill = "Share of country revenue", title = "Product × country revenue mix (top slice)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+*Interpretation:* Mix view avoids UK dominance; some products are country-specific while others travel across markets.
+
+## Unit price distribution (linear + log view)
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+unitprice_df <- sales %>% filter(UnitPrice > 0)
+
+p_unit <- ggplot(unitprice_df, aes(UnitPrice)) +
+  geom_histogram(fill = "#4e79a7", bins = 60) +
+  scale_x_continuous(labels = dollar) +
+  labs(x = "Unit price", y = "Count", title = "Unit price distribution (linear)") +
+  theme_minimal()
+
+p_unit_log <- ggplot(unitprice_df, aes(UnitPrice)) +
+  geom_histogram(fill = "#f28e2b", bins = 60) +
+  scale_x_log10(labels = dollar) +
+  labs(x = "Unit price (log scale)", y = "Count", title = "Unit price distribution (log)") +
+  theme_minimal()
+
+p_unit
+p_unit_log
+```
+
+*Interpretation:* Prices are right-skewed; log view shows most items in a narrow low-price band with a thin high-price tail.
+
+## Correlations among Quantity, UnitPrice, TotalPrice
+
+```{r, echo=FALSE}
+corr_df <- sales %>%
+  select(Quantity, UnitPrice, TotalPrice) %>%
+  cor(use = "complete.obs") %>%
+  round(2)
+kable(corr_df)
+```
+
+*Interpretation:* TotalPrice loads on both Quantity and UnitPrice (mechanically); Quantity and UnitPrice are weakly inversely related.
+
+## Seasonality decomposition (daily revenue, STL)
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(stl_df, aes(date, value)) +
+  geom_line() +
+  facet_wrap(~component, ncol = 1, scales = "free_y") +
+  labs(x = "Date", y = "Value", title = "STL decomposition (daily revenue, weekly seasonality)") +
+  theme_minimal()
+```
+
+*Interpretation:* Strong weekly seasonality (period ≈ 7 days) and an upward trend into Q4.
+
+## Customer RFM scatter
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+p_rfm <- ggplot(customers, aes(x = recency, y = monetary, color = frequency)) +
+  geom_point(alpha = 0.6) +
+  scale_color_viridis_c(option = "plasma") +
+  scale_y_continuous(labels = dollar) +
+  labs(x = "Recency (days since last purchase)", y = "Monetary", color = "Frequency", title = "Customer RFM snapshot") +
+  theme_minimal()
+p_rfm
+```
+
+*Interpretation:* Recent, frequent buyers drive spend; longer-recency, low-frequency customers look like churn risk and reactivation targets.
+
+## Regression: recency & frequency → monetary
+
+Model form:
+\[
+\text{Monetary}_i = \beta_0 + \beta_1 \cdot \text{Recency}_i + \beta_2 \cdot \text{Frequency}_i + \epsilon_i
+\]
+Empirically, \(\partial M / \partial F > 0\) and \(\partial M / \partial R < 0\).
+
+```{r, echo=FALSE}
+kable(rfm_lm_tidy %>% mutate(across(where(is.numeric), ~round(., 3))),
+      col.names = c("Term", "Estimate", "Std. Error", "t value", "Pr(>|t|)"))
+```
+
+```{r, echo=FALSE}
+kable(rfm_ci, col.names = c("Term", "CI low", "CI high"))
+```
+
+```{r, echo=FALSE}
+tibble(term = c("recency", "frequency"), VIF = c(vif_rec, vif_freq)) %>%
+  kable()
+```
+
+```{r, echo=FALSE}
+kable(rfm_int_tidy %>% mutate(across(where(is.numeric), ~round(., 3))),
+      col.names = c("Term", "Estimate", "Std. Error", "t value", "Pr(>|t|)"))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+rfm_resid <- augment(rfm_lm, customers)
+ggplot(rfm_resid, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.5, color = "#4e79a7") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(x = "Fitted", y = "Residual", title = "Residuals vs fitted (RFM regression)") +
+  theme_minimal()
+```
+
+- Graph: RFM scatter suggests higher frequency and lower recency correlate with higher spend.
+- Model: Frequency has a strong positive coefficient; recency is negative (more recent → higher spend). R² is moderate; residuals widen at the top end (heteroskedasticity possible). Interaction and frequency² are small; VIFs near 1 suggest low collinearity. Not causal.
+- Action: Focus retention on high-frequency recents; re-engage high-monetary but aging customers.
+
+### RFM clusters (4-means on scaled RFM)
+
+```{r, echo=FALSE}
+kable(rfm_clusters, format.args = list(digits = 1, big.mark = ","))
+```
+
+*Interpretation:* Segments separate into recent-heavy, frequency-heavy, and monetary-heavy groups; useful for targeted messaging.
+
+# Narrative highlights
+
+- Seasonality: Q4 lift with weekly pattern; demand concentrates midweek, daytime (see Shiny heatmap).
+- Products: A handful of SKUs contribute a large share of revenue; long-tail items exist but matter less.
+- Geography: UK dominates; pricing dispersion across top countries is tight, suggesting consistent catalog/pricing.
+- Operations timing: Midweek 9–15h shows strongest revenue; good windows for staffing/promotions.
+
+## Reasoning chain (A → B → C)
+
+- Q4 spike suggests calendar/weekly structure → inspected monthly and daily trends.  
+- Weekly pattern suggests time-of-week operational load → inspected weekday × hour heatmap.  
+- Heatmap shows daytime/midweek concentration → recommend staffing/promo focus in those windows.
+
+## Formal statements
+
+- Seasonality: Revenue shows periodicity with fundamental period ≈ 7 days, consistent with weekly retail cycles.  
+- RFM: Monetary value is approximately linear in frequency and inversely related to recency: \(\partial M / \partial F > 0\), \(\partial M / \partial R < 0\), consistent with lifecycle intuition.
+
+# Methods (brief)
+
+- Cleaning: type coercion; drop blank descriptions, missing CustomerID, and non-positive qty/price; derive InvoiceDate/Month, TotalPrice. Validated with counts and revenue check.  
+- EDA: time-series trends, Pareto, product×country mix, distributions (linear/log), correlations, STL decomposition for weekly seasonality.  
+- Modeling: linear RFM with CIs, VIF, interaction/nonlinear terms explored; residual diagnostics; k-means clustering on scaled RFM.  
+- Tools: data.table/dplyr/ggplot2/lubridate/broom.
+
+# References
+
+- Wickham et al. (2019) *R for Data Science*.  
+- Fader & Hardie (2005) customer-base analysis (RFM concepts).  
+- Hyndman & Athanasopoulos (2018) *Forecasting: Principles and Practice* (STL).
+
+# Group contributions
+
+- Rich Ann: Cleaning, missingness audit, derived fields, documentation.
+- Ray: EDA visuals, interactivity (Shiny), timing heatmap.
+- Ben and Morgan: RFM analysis, regression, narrative, report/app assembly.
+
+# Appendix: reproducibility code (cleaning, EDA, model)
+
+## Cleaning
+
+```{r, eval=FALSE}
+dt_raw <- fread(path)
+dt_clean <- dt_raw %>%
+  mutate(
+    InvoiceDateTime = as.POSIXct(InvoiceDateTime),
+    Quantity = as.numeric(Quantity),
+    UnitPrice = as.numeric(UnitPrice)
+  ) %>%
+  filter(!is.na(Description) & Description != "",
+         !is.na(CustomerID),
+         Quantity > 0,
+         UnitPrice > 0) %>%
+  mutate(
+    InvoiceDate = as.Date(InvoiceDateTime),
+    InvoiceMonth = floor_date(InvoiceDateTime, unit = "month"),
+    TotalPrice = Quantity * UnitPrice
+  )
+```
+
+## EDA figures
+
+```{r, eval=FALSE}
+# Monthly trend
+monthly_df <- dt_clean %>%
+  group_by(InvoiceMonth) %>%
+  summarise(revenue = sum(TotalPrice), orders = n_distinct(InvoiceNo))
+
+ggplot(monthly_df %>% pivot_longer(c(revenue, orders)),
+       aes(InvoiceMonth, value, color = name)) + geom_line()
+
+# Product Pareto
+product_rev <- dt_clean %>% group_by(Description) %>% summarise(revenue = sum(TotalPrice))
+```
+
+## RFM model
+
+```{r, eval=FALSE}
+customers <- dt_clean %>%
+  group_by(CustomerID) %>%
+  summarise(recency = as.numeric(max(dt_clean$InvoiceDate) + 1 - max(InvoiceDate)),
+            frequency = n_distinct(InvoiceNo),
+            monetary = sum(TotalPrice))
+
+rfm_lm <- lm(monetary ~ recency + frequency, data = customers)
+summary(rfm_lm)
+
+# Interaction / nonlinear variant
+rfm_lm_int <- lm(monetary ~ recency + frequency + I(frequency^2) + recency:frequency, data = customers)
+
+# VIF (manual, two predictors)
+vif_rec <- 1 / (1 - summary(lm(recency ~ frequency, data = customers))$r.squared)
+vif_freq <- 1 / (1 - summary(lm(frequency ~ recency, data = customers))$r.squared)
+```
